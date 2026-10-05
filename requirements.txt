@@ -3,3 +3,8 @@ youtube-transcript-api
 llama-cpp-python
 huggingface-hub
 transformers
+langchain
+langchain-community
+langchain-huggingface
+faiss-cpu
+sentence-transformers

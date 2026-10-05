@@ -3,197 +3,167 @@ from urllib.parse import urlparse, parse_qs
 from youtube_transcript_api import YouTubeTranscriptApi
 from huggingface_hub import hf_hub_download
 from llama_cpp import Llama
-from transformers import AutoTokenizer  # <-- ADDED FOR EXACT TOKENIZATION
+from transformers import AutoTokenizer
+from langchain_community.vectorstores import FAISS
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.documents import Document
 
-# --- PAGE CONFIGURATION ---
-st.set_page_config(
-    page_title=" Local YouTube Summarizer",
-    page_icon="🎬",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+st.set_page_config(page_title="Youtube AI summarizer", page_icon="🎓", layout="wide")
 
-# --- CACHE THE MODEL & TOKENIZER ---
+# --- CACHE THE MODELS ---
 @st.cache_resource(show_spinner=False)
-def load_model(context_size=16384):
-    repo_id = "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
-    filename = "qwen2.5-0.5b-instruct-q4_k_m.gguf"
-    
-    # 1. Download model if not cached
+def load_llm(context_size=16384):
+    repo_id = "Qwen/Qwen2.5-1.5B-Instruct-GGUF"
+    filename = "qwen2.5-1.5b-instruct-q4_k_m.gguf"
     model_path = hf_hub_download(repo_id=repo_id, filename=filename)
     
-    # 2. Initialize the Llama CPP engine with Qwen
     llm = Llama(
         model_path=model_path,
-        n_ctx=context_size,  # Max context window
-        n_threads=4,         # Adjust this based on your CPU cores
-        n_gpu_layers=-1,
-        verbose=False        # Hides the generation logs from terminal
+        n_ctx=context_size,
+        n_threads=4,
+        n_gpu_layers=-1, 
+        verbose=False
     )
-    
-    # 3. Initialize the exact tokenizer for Qwen to perfectly count tokens
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
-    
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
     return llm, tokenizer
+
+@st.cache_resource(show_spinner=False)
+def load_embedding_model():
+    
+    return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
 # --- HELPER FUNCTIONS ---
 def extract_video_id(url: str) -> str:
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
-    if host.startswith("www."):
-        host = host[4:]
-
-    if host == "youtu.be":
-        video_id = parsed.path.lstrip("/").split("/")[0]
-        if video_id:
-            return video_id
-
+    if host.startswith("www."): host = host[4:]
+    if host == "youtu.be": return parsed.path.lstrip("/").split("/")[0]
     if host in ("youtube.com", "m.youtube.com", "music.youtube.com"):
         qs = parse_qs(parsed.query)
-        if qs.get("v"):
-            return qs["v"][0]
-        parts = parsed.path.strip("/").split("/")
-        if len(parts) >= 2 and parts[0] in ("shorts", "embed", "live", "v"):
-            return parts[1]
-
+        if qs.get("v"): return qs["v"][0]
     raise ValueError("No video ID found in URL.")
 
-# --- MODIFIED: PERFECT TOKEN-BASED CHUNKING ---
-def get_text_chunks(text, tokenizer, max_tokens=10000):
-    """
-    Uses the model's actual tokenizer to split text accurately.
-    10,000 max tokens ensures it fits comfortably within the 16,384 limit.
-    """
+def get_text_chunks(text, tokenizer, max_tokens=2000):
+    # Reduced chunk size to 2000 so the Chat context is highly specific
     tokens = tokenizer.encode(text, add_special_tokens=False)
-    chunks = []
-    
-    for i in range(0, len(tokens), max_tokens):
-        chunk_tokens = tokens[i : i + max_tokens]
-        chunks.append(tokenizer.decode(chunk_tokens))
-        
-    return chunks
+    return [tokenizer.decode(tokens[i : i + max_tokens]) for i in range(0, len(tokens), max_tokens)]
 
-def summarize_chunks(chunks, llm, max_len, temperature):
-    chunk_summaries = []
-    progress_bar = st.progress(0)
-    
-    for i, chunk in enumerate(chunks):
-        messages = [
-            {"role": "system", "content": "You are a precise AI assistant. Summarize the following transcript exactly as it is written. DO NOT make up information. DO NOT hallucinate. If the transcript is in Arabic, reply in Arabic."},
-            {"role": "user", "content": f"Here is the transcript:\n\n{chunk}\n\nPlease summarize this:"}
-        ]
-        
-        response = llm.create_chat_completion(
-            messages=messages,
-            max_tokens=max_len,
-            temperature=temperature,
-            repeat_penalty=1.15 
-        )
-        
-        summary = response["choices"][0]["message"]["content"].strip()
-        chunk_summaries.append(summary)
-        
-        progress_bar.progress((i + 1) / len(chunks))
 
-    return chunk_summaries
+def create_vector_store(chunks, embeddings):
+    # Convert string chunks into LangChain Documents, then build a searchable database
+    docs = [Document(page_content=chunk) for chunk in chunks]
+    vectorstore = FAISS.from_documents(docs, embeddings)
+    return vectorstore
 
-def synthesize_summaries(summaries, llm, max_len, temperature):
-    if len(summaries) == 1:
-        return summaries[0]
-
-    combined_text = "\n\n".join(summaries)
-    
+# --- GENERATION FUNCTIONS ---
+def generate_content(prompt, system_instruction, llm, max_len, temperature):
     messages = [
-        {"role": "system", "content": "You are a precise AI assistant. Combine these summaries into a final overview. Stick strictly to the facts provided. DO NOT add outside information."},
-        {"role": "user", "content": f"Partial Summaries:\n\n{combined_text}\n\nProvide the final comprehensive summary:"}
+        {"role": "system", "content": system_instruction},
+        {"role": "user", "content": prompt}
     ]
-    
     response = llm.create_chat_completion(
-        messages=messages,
-        max_tokens=max_len,
-        temperature=temperature,
-        repeat_penalty=1.15  # <--- THIS STOPS REPETITION LOOPS
+        messages=messages, max_tokens=max_len, temperature=temperature, repeat_penalty=1.15
     )
-    
     return response["choices"][0]["message"]["content"].strip()
 
 # --- MAIN UI ---
 def main():
-    st.title("🎬 Local YouTube Summarizer")
-    st.markdown("Summarize videos completely offline using **Qwen 2.5 0.5B**.")
-
-    # Load Model (Cached) - MODIFIED to also unpack tokenizer
-    with st.spinner("Loading Qwen Model and Tokenizer... (Downloads on first run)"):
-        llm, tokenizer = load_model()
-
-    # --- SIDEBAR CONTROLS ---
-    with st.sidebar:
-        st.header("⚙️ Model Settings")
-        
-        max_length = st.slider(
-            "Max Summary Tokens", 
-            min_value=200, max_value=1500, value=800, step=100
-        )
-        
-        temperature = st.slider(
-            "Temperature (Creativity)", 
-            min_value=0.0, max_value=1.0, value=0.3, step=0.1
-        )
-        
-        languages = st.text_input("Transcript Languages (comma-separated)", value="en,ar")
-
-    # --- MAIN CONTENT AREA ---
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        url = st.text_input("🔗 Enter YouTube Video URL:", placeholder="https://www.youtube.com/watch?v=...")
+    st.title("🎓 Youtube AI Tutor & Summarizer")
     
-    with col2:
-        st.write("") 
-        st.write("")
-        summarize_button = st.button("🚀 Summarize Video", use_container_width=True, type="primary")
+    with st.spinner("Loading AI Models (LLM + Embeddings)..."):
+        llm, tokenizer = load_llm()
+        embeddings = load_embedding_model()
 
-    if summarize_button and url:
+    with st.sidebar:
+        st.header("⚙️ Settings")
+        max_length = st.slider("Max Generation Tokens", 200, 2000, 800, 100)
+        temperature = st.slider("Temperature", 0.0, 1.0, 0.2, 0.1)
+        languages = st.text_input("Languages", "ar,en")
+
+    url = st.text_input("🔗 Enter YouTube Video URL:")
+    
+    if st.button("🚀 Process Video") and url:
         try:
             with st.status("Processing Video...", expanded=True) as status:
-                
-                st.write("🔍 Extracting video ID...")
+                st.write("🔍 Extracting video ID & Fetching subtitles...")
                 video_id = extract_video_id(url)
+                fetched = YouTubeTranscriptApi().fetch(video_id, languages=[l.strip() for l in languages.split(',')])
+                raw_text = "\n".join(s.text for s in fetched)
                 
-                st.write(f"📝 Fetching subtitles...")
-                langs_list = [l.strip() for l in languages.split(',')]
+                st.write("✂️ Chunking text & Building Vector Database...")
+                chunks = get_text_chunks(raw_text, tokenizer)
                 
-                # --- FIXED: Restored your original API fetch logic ---
-                api = YouTubeTranscriptApi()
-                fetched = api.fetch(video_id, languages=langs_list)
-                raw_text = "\n".join(snippet.text for snippet in fetched)
-                # -----------------------------------------------------
-
-                # --- MODIFIED: Use accurate HuggingFace tokenization ---
-                st.write("✂️ Accurately chunking text by tokens...")
-                chunks = get_text_chunks(raw_text, tokenizer, max_tokens=10000)
-                st.write(f"Created {len(chunks)} exact token chunk(s).")
+                # Save Vectorstore and Transcript to Session State so we can chat later
+                st.session_state.vectorstore = create_vector_store(chunks, embeddings)
+                st.session_state.raw_text = raw_text
+                st.session_state.chunks = chunks
                 
-                st.write("🧠 Generating summaries...")
-                intermediate_summaries = summarize_chunks(chunks, llm, max_length, temperature)
+                # Clear chat history when a new video is processed
+                st.session_state.chat_history = []
                 
-                if len(intermediate_summaries) > 1:
-                    st.write("🔗 Combining chunk summaries...")
-                    final_summary = synthesize_summaries(intermediate_summaries, llm, max_length, temperature)
-                else:
-                    final_summary = intermediate_summaries[0]
-                
-                status.update(label="Summarization Complete!", state="complete", expanded=False)
-
-            st.success("Summary Generated Successfully!")
-            st.markdown("### 📋 Final Summary")
-            st.info(final_summary)
-
-            with st.expander("Show Raw Transcript"):
-                st.text_area("Original Transcript text", raw_text, height=300)
-
+                status.update(label="Processing Complete!", state="complete", expanded=False)
         except Exception as e:
-            st.error(f"An error occurred: {e}")
-            st.warning("Make sure the video has subtitles available in the requested languages.")
+            st.error(f"Error: {e}")
+            return
+
+    # --- UI TABS ---
+    if "raw_text" in st.session_state:
+        tab1, tab2, tab3 = st.tabs(["📝 Summary", "📚 Study Pack & Quiz", "💬 Chat with Video"])
+        
+        # TAB 1: SUMMARY
+        with tab1:
+            if st.button("Generate Summary"):
+                with st.spinner("Synthesizing Summary..."):
+                    sys_prompt = "You are a precise AI. Summarize the provided text comprehensively using bullet points."
+                    # If video is short, summarize at once. If long, summarize chunks 
+                    combined_text = "\n".join(st.session_state.chunks[:3]) # Limit to first few for speed, scale as needed
+                    summary = generate_content(f"Transcript:\n{combined_text}", sys_prompt, llm, max_length, temperature)
+                    st.success("Summary Generated!")
+                    st.info(summary)
+                    
+        # TAB 2: STUDY PACK & QUIZ
+        with tab2:
+            if st.button("Generate Study Pack"):
+                with st.spinner("Generating Flashcards and Quiz..."):
+                    sys_prompt = "You are an expert educator. Extract key concepts and create a multiple-choice quiz."
+                    user_prompt = f"Based on this transcript, provide:\n1. 5 Key Flashcard Terms with Definitions\n2. A 3-question Multiple Choice Quiz with an answer key at the very bottom.\n\nTranscript:\n{st.session_state.chunks[0]}..."
+                    
+                    study_pack = generate_content(user_prompt, sys_prompt, llm, 1200, temperature)
+                    st.success("Study Pack Ready!")
+                    st.markdown(study_pack)
+
+        # TAB 3: LANGCHAIN RAG CHAT
+        with tab3:
+            st.markdown("### Ask questions about the video!")
+            
+            # Display Chat History
+            for message in st.session_state.chat_history:
+                with st.chat_message(message["role"]):
+                    st.markdown(message["content"])
+
+            # Chat Input
+            if prompt := st.chat_input("E.g., What was the main argument about X?"):
+                # 1. Add user message to UI
+                st.chat_message("user").markdown(prompt)
+                st.session_state.chat_history.append({"role": "user", "content": prompt})
+
+                # 2. Retrieve relevant chunks using FAISS
+                with st.spinner("Searching video context..."):
+                    docs = st.session_state.vectorstore.similarity_search(prompt, k=3)
+                    context = "\n\n".join([doc.page_content for doc in docs])
+
+                # 3. Formulate RAG prompt
+                system_instruction = "You are a helpful AI tutor answering questions based ONLY on the provided video context. If the answer is not in the context, say 'I cannot find the answer in the video'."
+                rag_prompt = f"Video Context:\n{context}\n\nUser Question: {prompt}\n\nAnswer:"
+                
+                # 4. Generate Answer
+                with st.chat_message("assistant"):
+                    with st.spinner("Thinking..."):
+                        answer = generate_content(rag_prompt, system_instruction, llm, max_length, temperature)
+                        st.markdown(answer)
+                
+                # 5. Save to history
+                st.session_state.chat_history.append({"role": "assistant", "content": answer})
 
 if __name__ == "__main__":
     main()
