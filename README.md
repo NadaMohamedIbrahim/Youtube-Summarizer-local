@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # 🎓 AI YouTube Tutor & Summarizer
 
 A Streamlit web app that extracts YouTube transcripts and acts as a personalized AI tutor. Built with `llama-cpp-python`, LangChain, and FAISS vector databases.
